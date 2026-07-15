@@ -62,7 +62,7 @@ The assignment requires ≥ 20,000 QPS or ≥ 10M DAU. This design clears both a
 | Action | Per user/day | Total/day | Business-hour avg QPS | Peak (×2.5) |
 |---|---|---|---|---|
 | Submit query | 20 | 200M | 6,940 | 17,350 |
-| Load conversation history | 10 | 100M | 3,472 | 8,681 |
+| Open past conversation (UI browse) | 10 | 100M | 3,472 | 8,681 |
 | View citation / source document | 5 | 50M | 1,736 | 4,340 |
 | **Total reads** | | **350M** | **12,148** | **30,371** |
 
@@ -81,6 +81,7 @@ Three things this breakdown surfaces:
 1. **Message writes are the largest single QPS figure in the system** (34,722 peak Year 1, ~72,000 by Year 5) — larger than query reads, because every question produces two rows. This is what justifies Cassandra on the conversation path.
 2. **History reads and citation views never enter the retrieval funnel.** No embedding, no vector search, no reranker, no LLM. Only the query-submission line drives the sizing of the expensive pipeline in Section 12.
 3. Message writes are averaged over business hours, not 24 hours, because they happen exactly when users are active. Averaging them over a full day would understate peak by ~3×.
+4. **One read doesn't appear in this table because it isn't a user action:** every submitted query internally loads the conversation's recent turns for rewriting (Flow 2, step 1) — and it happens *before* the cache lookup, so it fires on every query, cache hit or miss alike. That internal read therefore tracks the **full query-submission rate**, not the post-cache figure: **~17,350 QPS at Year-1 peak, ~35,977 at Year 5**. It lands on Cassandra alongside the UI-browse reads above, and is sized against Cassandra's read capacity in Section 12, which would otherwise look like a write-only store in this document.
 
 ### 20%/year growth — 5-year projection
 
@@ -168,6 +169,7 @@ erDiagram
 | Chunk embeddings | Vector store (HNSW) | B-trees compare ordered scalars; similarity in 768-dimensional space needs a graph-based ANN index |
 | Keyword/exact-match index | BM25 (OpenSearch) | Catches exact tokens (error codes, SKUs, acronyms) that dense embeddings miss |
 | Conversations/Messages | Cassandra | 400M append-only rows/day, always read as a time-ordered range per conversation — an LSM write path fits, a B-tree fights it |
+| Raw document parsing (PDF/Office/HTML → text + metadata) | **Apache Tika** | Standard, format-agnostic extraction library — handles the "parse" half of Ingestion's "parse + chunk" step (Section 8, Flow 1) across every source type the FRs list (PDF, wikis, Slack exports, SharePoint) without a bespoke parser per format |
 
 ### Row-level storage calculations (Year 1)
 
@@ -230,28 +232,28 @@ flowchart TD
         AdminApp["Tenant Admin Console"]
     end
 
-    Gateway["API Gateway / LB pool<br/>per-tenant rate limits"]
+    Gateway["API Gateway / LB pool<br/>4 nodes (N+1) · per-tenant rate limits"]
 
     subgraph QueryPath["Query Path (read-heavy, latency-critical)"]
-        QuerySvc["Query Service<br/>rewrite / orchestrate"]
-        AnsCache[["Answer Cache (Redis)<br/>citation-verified on hit"]]
-        EmbedSvc["Query Embedding<br/>(GPU pool)"]
-        RetrievalSvc["Retrieval Funnel<br/>group filter → hybrid → RRF"]
-        Rerank["Reranker<br/>(cross-encoder, GPU pool)"]
-        ConvSvc["Conversation Service"]
+        QuerySvc["Query Service<br/>25 instances @ 500 req/s"]
+        AnsCache[["Answer Cache (Redis)<br/>8 shards × 2 (primary+replica) = 16 nodes"]]
+        EmbedSvc["Query Embedding<br/>7 GPU instances @ 2,000 emb/s"]
+        RetrievalSvc["Retrieval Funnel<br/>group filter → hybrid → RRF<br/>(logic inside Query Service)"]
+        Rerank["Reranker (cross-encoder)<br/>61 GPU instances @ 200 req/s"]
+        ConvSvc["Conversation Service<br/>~32 instances @ 2,000 ops/s"]
     end
 
     subgraph IngestPath["Ingestion Path (write-light, async)"]
-        Queue[["Kafka<br/>partitioned by doc_id"]]
-        IngestSvc["Ingestion Service"]
-        ChunkSvc["Chunking + Embedding<br/>(autoscaled)"]
+        Queue[["Kafka<br/>3 brokers, RF=3, keyed by doc_id"]]
+        IngestSvc["Ingestion Service<br/>3 instances (low QPS)"]
+        ChunkSvc["Chunking + Embedding<br/>autoscaled on queue depth"]
     end
 
     subgraph DataLayer["Data Layer"]
-        PG[("PostgreSQL<br/>metadata + ACL groups")]
-        VecDB[("Vector Store<br/>HNSW, tenant-sharded")]
-        BM25[("BM25 / OpenSearch<br/>shared indices + routing")]
-        Cass[("Cassandra<br/>messages, tiered")]
+        PG[("PostgreSQL<br/>1 primary + 1 sync standby<br/>+ 3 read replicas")]
+        VecDB[("Vector Store — 20 nodes<br/>RF=3 in footprint, tenant-sharded")]
+        BM25[("BM25 / OpenSearch — 16 nodes<br/>1 primary + 2 replica shards")]
+        Cass[("Cassandra — 39 nodes<br/>RF=3, messages tiered")]
     end
 
     LLM["LLM Provider<br/>(external, + fallback provider)"]
@@ -276,7 +278,14 @@ flowchart TD
     QuerySvc -.->|"stream tokens (SSE)"| UserApp
 ```
 
-Layout notes: the query path and ingestion path share no services — only data stores. The gateway box represents a redundant pool behind DNS/anycast, drawn as one box for clarity (Section 12's SPOF table makes this explicit). Answer streaming (dashed) reduces perceived latency: the user sees the first token in ~1s while full generation completes within the 3s budget.
+**All counts are Year 1** (Section 12's scalability diagram carries the Year 1 → Year 5 progression). Counts for the Query Service, Query Embedding, Reranker, and all four data stores come straight from Section 12's sizing table. Four components appear with counts derived here, each from a stated assumption:
+
+- **Gateway — 4 nodes (N+1):** user-facing Year-1 peak = 17,350 queries + 8,681 conversation browses + 4,340 citation views ≈ 30,400 req/s; at ~10K req/s per L7 node, 3 carry the load and the fourth is failure headroom.
+- **Answer cache — 8 shards × 2 = 16 nodes:** entry ≈ 3 KB (answer + citation doc_ids + key); with a 24h TTL the working set is roughly one day of distinct rewritten queries ≈ 140M × 3 KB ≈ 420 GB → 8 primaries at ~60 GB usable each, one replica per primary for failover (the cache is a cost optimization, but §13 row 6 shows why losing it hurts — replicas keep a node failure from becoming a 12.5% hit-rate cliff).
+- **Kafka — 3 brokers, RF=3:** ingestion throughput is trivial (~6 msg/s); broker count is set by durability quorum, not load — the minimum that survives one broker failure without losing acknowledged uploads.
+- **Conversation Service — ~32 instances:** it fronts every Cassandra interaction: message writes (34,722 peak) + internal turn-loads (**17,350** — the full query-submission rate, since turn-loading runs before the cache check on every query, not just on misses) + UI browses (8,681) + creates (2,604) ≈ 63,357 ops/s; at ~2,000 ops/s per thin stateless instance → 32. It needs more instances than the Query Service because it handles the platform's largest QPS stream (Section 4, point 1) even though each operation is far cheaper.
+
+Layout notes: the query path and ingestion path share no services — only data stores. The gateway box represents a redundant pool behind DNS/anycast (Section 12's SPOF table makes this explicit). Answer streaming (dashed) reduces perceived latency: the user sees the first token in ~1s while full generation completes within the 3s budget. The Retrieval Funnel box is drawn separately for readability but runs as logic inside the Query Service — it is not a separately deployed fleet, which is why it carries no instance count.
 
 ---
 
@@ -332,6 +341,7 @@ sequenceDiagram
     participant API as Gateway
     participant K as Kafka (key=doc_id)
     participant Ing as IngestionService
+    participant Tika as ApacheTika
     participant Chunk as Chunking+Embedding
     participant PG as PostgreSQL
     participant Vec as VectorStore
@@ -344,7 +354,9 @@ sequenceDiagram
     API->>K: enqueue (key = doc_id)
     Note over K: same doc_id → same partition →<br/>strictly ordered, one consumer at a time
     K->>Ing: consume
-    Ing->>Chunk: parse + chunk
+    Ing->>Tika: extract text + metadata (PDF/Office/HTML/etc.)
+    Tika-->>Ing: plain text + doc metadata
+    Ing->>Chunk: chunk extracted text
     Chunk->>Chunk: embed + enrich (summary, keywords)
     Note over Chunk: chunk_id = hash(doc_id, version, ordinal)<br/>→ every write below is an idempotent upsert
     Chunk->>PG: upsert chunk rows (version=N+1)
@@ -355,6 +367,8 @@ sequenceDiagram
     Ing--)Admin: webhook INDEXED
     Note over Ing: old-version chunks GC'd asynchronously
 ```
+
+**Why Apache Tika specifically:** the FRs name four+ source formats (PDF, wikis, Slack exports, SharePoint documents, which themselves span Word/Excel/PowerPoint). Tika is a single format-agnostic extraction library covering all of them (1,000+ formats via one API) plus embedded metadata (author, creation date, language) that feeds the ACL and enrichment steps downstream — the alternative is a bespoke parser per format, which is real maintenance surface for zero functional gain.
 
 Three correctness decisions, each closing a specific failure:
 
@@ -462,6 +476,8 @@ A community-sourced retrieval-mechanism reference proposed three pillars: ingest
 
 **Adopted — top-5 context limit as a cost control.** Section 14 shows input tokens dominate LLM spend. Sending the top 5 reranked chunks (~2K tokens) instead of a fat top-20 context (~8K tokens) cuts the largest cost line in the platform by ~4× at equal or better answer quality — the reranker exists precisely so that fewer, better chunks reach the expensive model. This is the clearest example in the design of a component (reranker GPU pool) whose cost is justified by the larger cost it removes (LLM input tokens).
 
+**Adopted — Apache Tika for document parsing (Section 5, Section 8).** Not part of the original reference doc's three pillars, but a necessary zeroth step before chunking can happen at all — added here because a system spanning PDF, Office, wikis, and Slack exports needs one extraction layer, not four bespoke ones.
+
 **Deliberately not adopted — Planner/Router/multi-agent orchestration.** Architecturally sound, out of scope: it advances no stated FR or NFR at this scale, and every added hop in the hot path spends latency budget the P95 target cannot spare. Noted as an extension point, not designed — over-engineering is a rubric failure, not a flex.
 
 ---
@@ -480,6 +496,7 @@ A community-sourced retrieval-mechanism reference proposed three pillars: ingest
 | **Whale-tenant sub-sharding** | A 5M+ doc tenant on one shard is a hot, oversized shard | Tenants above ~1M chunks split by secondary hash on chunk_id across shards — the celebrity-user pattern applied to tenants | Whale queries fan out to a few shards and merge — small latency cost paid only by the tenants causing the skew |
 | **Consistent hashing** for tenant→shard | Modulo reshuffles nearly all tenants on any node change | Adding a node remaps only the affected ring segment | Slightly more code than modulo; standard libraries make it cheap |
 | **BM25: shared indices + tenant routing**, not index-per-tenant | 100K tenants = 100K indices would blow up OpenSearch cluster state (practical ceiling is a few thousand) | Tenants share indices, routed and filtered by tenant_id; whales get dedicated indices | Shared-index tenants are one filter away from each other on this store — mitigated by routing + the group filter; whales, the highest-value targets, remain fully separated |
+| **Apache Tika** for extraction | One library across PDF/Office/HTML/wikis/Slack exports instead of a parser per format | Feeds a normalized text stream into chunking regardless of source type | Generic extraction occasionally loses source-specific structure (e.g. complex table layouts) that a bespoke parser would preserve — accepted; chunking's summary/keyword enrichment (Section 10) recovers most of the practical loss |
 
 ### Conversation & Storage
 
@@ -557,6 +574,8 @@ The v1 draft mixed Year-5 traffic with Year-1 storage on one diagram. Fixed: eve
 **The key finding: the data layer is storage-bound, not throughput-bound.** Every stateful store needs 2–6× more nodes for capacity than its query load alone would demand — throughput headroom comes along free. The one place this narrows is Cassandra at Year 5 (80 storage-bound vs 36 throughput-bound), which is exactly why the tiered-retention decision matters: without it, the hot tier would be 2.5× larger and the node count would follow.
 
 **The query-side embedding pool exists because someone has to embed 25K queries/sec.** v1 modeled embedding as an ingestion-only concern (~12 docs/sec) and silently assumed query vectors appear for free. They don't: at Year 5 peak, query embedding is 25,184 GPU inferences/sec — unmodeled, it would have been the largest surprise cost in the system. Self-hosted on ~13 GPU instances it is a rounding error next to the reranker; as external API calls it would add ~$8K/day. Model it, then choose self-hosting.
+
+**Cassandra's read side is covered by the nodes storage already bought.** Everything above sizes Cassandra by writes and capacity, but it serves two read streams too: the internal per-query "load recent turns" read — which fires *before* the cache check on every submitted query, cache hit or miss, so it tracks the full query-submission rate (**17,350 QPS Y1 → 35,977 Y5**), not the post-cache figure — plus UI conversation-browse reads (~8,681 Y1 → ~18,000 Y5 peak). Combined worst case: **Y1 ≈ 17,350 + 8,681 = 26,031 reads/s across 39 nodes ≈ 667 reads/s/node**; **Y5 ≈ 35,977 + 18,000 = 53,977 reads/s across 80 nodes ≈ 675 reads/s/node** — trivial for single-partition reads at CL=ONE (thousands/s/node), and both streams read the newest, hottest partitions, which sit in row cache. The storage-bound conclusion survives contact with the read path; it just needed to be checked with the right input rate rather than the post-cache one.
 
 **PostgreSQL stays vertical.** The hot per-query read is group-membership resolution — a few rows from a ~12 GB table that lives entirely in buffer cache, served by the primary at up to ~25K lookups/sec at Year-5 peak. That is comfortable for a single well-provisioned instance on an indexed point lookup, and the honest statement is: this makes the primary a query-path dependency, so it appears in the SPOF table below with its failover story. Sharding a 6.6 TB metadata store to avoid a dependency that managed failover already covers would be spending complexity where no requirement asks for it.
 
@@ -642,7 +661,7 @@ Illustrative unit prices (small-model API tier: $0.15/M input tokens, $0.60/M ou
 
 **Everything else (order of magnitude, monthly):**
 - Reranker GPUs: 61 × ~$600 ≈ $37K · Embedding GPUs: 7 × ~$600 ≈ $4K
-- Data layer (~75 nodes) + service fleet + gateway ≈ $100–150K
+- Data layer (~100 nodes incl. cache + brokers) + service fleet + gateway ≈ $100–150K
 - Redis answer cache ≈ $10K
 - **Total non-LLM ≈ $200–250K/month → LLM : infrastructure ≈ 10 : 1**
 
@@ -652,10 +671,46 @@ Illustrative unit prices (small-model API tier: $0.15/M input tokens, $0.60/M ou
 |---|---|---|
 | Answer cache @ 30% | 60M generations/day never happen | ~$36K/day ≈ **$1.1M/month** — against ~$10K/month of Redis. The single highest-ROI component in the platform |
 | Top-5 context (reranker-enabled) | 2K input tokens instead of ~8K for a naive top-20 stuffing | ~$126K/day avoided — the reranker pool ($37K/mo) pays for itself ~100× over |
-| Rerank top-50 not top-100 | Halves the priciest GPU pool | ~$37K/month at Y5 scale |
+| Rerank top-50 not top-100 | Halves the priciest GPU pool | ~$37K/month at Y1 (61 avoided instances × $600), ~$76K/month at Y5 (126 avoided) — the avoided pool doubles with traffic |
 | Tiered message retention | −59% on the largest storage line | ~137 TB of replicated hot storage not bought |
 | Self-hosted query embedding | 13 GPUs vs per-call API pricing | ~$8K/day avoided at Y5 |
 | Ingestion-time enrichment | LLM tokens spent once per chunk (6/sec) instead of per query (17K/sec) | Puts enrichment on the cheap side of a 3,000× frequency gap |
+
+### Build vs. buy: API LLM or self-hosted — the largest single cost decision in the platform
+
+The $2.5M/month figure above assumes API pricing. At this volume, that assumption deserves its own analysis, because generation is ~10× everything else combined. Three options, costed at Year 1 (illustrative list prices; volume discounts improve the API side somewhat):
+
+**Option A — Commercial API, small-model tier** (GPT-4o-mini / Claude Haiku class, ~$0.15/M input, ~$0.60/M output):
+- 140M generations/day × (2K in + 500 out) ≈ **$84K/day ≈ $2.5M/month**, scaling linearly to ~$5.2M/month by Year 5.
+- Frontier-tier models (~$3/M in, ~$15/M out) at the same volume would run ~$1.9M/day — ruled out for bulk traffic on arithmetic alone. This matters: grounded Q&A over 5 pre-retrieved, reranked chunks is a *reading* task, not a reasoning task, and it is exactly what small models handle well. The retrieval funnel's quality is what makes the cheap generation tier viable.
+
+**Option B — Self-hosted open-weights model** (8B-class, e.g., Llama-3.1-8B, served with vLLM continuous batching, fp8):
+- Peak demand: 12,145 cache-miss generations/sec × 500 output tokens ≈ **6.1M output tokens/sec**.
+- One H100 serving an 8B at ~6,000 output tok/s aggregate → **~1,000 GPUs at peak**.
+- The fleet does not run at peak 24/7: load is business-hours shaped (Section 4), so an autoscaled reserved + spot blend averages ~40% of peak provisioned → ~400 GPU-months effective. At ~$2.20/hr blended: **~$650K/month in compute**, plus ~$100K/month loaded cost for the inference/SRE engineering this now requires → **~$750K/month**.
+- The same math with a 70B model (~750 output tok/s per H100 under tensor parallelism) needs ~8,000 GPUs at peak — **more expensive than the API**. Self-hosting only wins with small models, which circles back to why the funnel narrows to top-5 high-quality chunks.
+
+**Option C — Hybrid with confidence routing (recommended):**
+- Self-hosted 8B serves the bulk; queries where retrieval confidence is low or the model self-reports uncertainty escalate to the API (~10% of traffic → ~$250K/month at mini-tier). Optional frontier escalation for a hardest ~1% adds ~$0.6M/month if quality data demands it.
+- **Total ≈ $1.0M/month vs $2.5M pure API — a ~60% cut (~$18M/year at Y1, widening with growth)**, without betting the platform's answer quality on an 8B handling every query.
+- The query-rewrite step and ingestion enrichment (both small-model tasks already) move to the same self-hosted pool for free.
+
+| | A: API only | B: Self-host only | C: Hybrid |
+|---|---|---|---|
+| Y1 monthly cost | $2.5M | ~$750K | **~$1.0M** |
+| Y5 monthly cost | ~$5.2M | ~$1.55M | ~$2.1M |
+| Elasticity | Perfect — pay per token | Pay for peak-shaped fleet | Fleet for bulk, API absorbs spikes |
+| Quality ceiling | Provider's best models on tap | Capped at what an 8B does well | 8B bulk + escalation path |
+| Ops burden | None | Inference team, GPU capacity mgmt | Inference team, smaller |
+| Data boundary | Third party (zero-retention terms needed) | Fully in-house — a **sales feature** for enterprise tenants | In-house for ~90% of queries |
+| SPOF posture | External provider (§12 SPOF table) | Own fleet — provider outage immunity | Best of both: each side is the other's fallback |
+
+**Decision: phase it.**
+- **Phase 1 (launch → ~3M DAU):** pure API, mini-tier. Zero capex, no ML-ops team while the product finds fit, and per-query cost/quality telemetry accumulates. The crossover math: self-hosting's ~$750K/month fixed cost beats the API only above ~30% of Year-1 volume — below ~3M DAU, self-hosting is paying for idle GPUs.
+- **Phase 2 (past crossover):** migrate bulk traffic to the self-hosted 8B with API escalation (Option C). The routing layer built in Phase 1's telemetry decides what escalates.
+- Compliance middle ground at any phase: VPC-deployed managed endpoints (Azure OpenAI / AWS Bedrock private deployments) for tenants whose procurement forbids shared-infrastructure APIs — API economics, tenant-approvable data boundary.
+
+This is also a risk decision, not only a cost one: Option C removes the LLM provider as a hard SPOF (Section 12) because the self-hosted pool and the API are each other's fallback — the circuit-breaker mitigation stops being "degrade to chunks-only" and becomes "route to the other backend."
 
 The pattern worth stating on a slide: **every major cost decision in this design trades a small fixed infrastructure cost for a large variable token cost.** That is the correct direction for any LLM-backed platform, because tokens scale with usage and hardware amortizes.
 
@@ -676,9 +731,9 @@ The pattern worth stating on a slide: **every major cost decision in this design
 
 ---
 
-## 16. Algorithms Reference
+## 16. Algorithms & Tools Reference
 
-| Algorithm | Used for | Why over alternatives |
+| Algorithm / Tool | Used for | Why over alternatives |
 |---|---|---|
 | **HNSW** | Vector similarity search | O(log N) approximate search vs O(N) brute force; the semantic-space analogue of a GeoHash/Quadtree choice in geographic systems |
 | **BM25** | Keyword/exact-match search | Term-frequency ranking catches exact tokens embeddings miss |
@@ -687,6 +742,7 @@ The pattern worth stating on a slide: **every major cost decision in this design
 | **Deterministic content-addressed IDs** | Idempotent ingestion | Turns at-least-once delivery from a duplication bug into a safe retry |
 | **Token bucket** | Per-tenant rate limiting | Allows bursts within a sustained-rate cap — matches real enterprise usage shape |
 | **LRU + TTL (+ event invalidation)** | Answer cache | Bounds memory; events bound staleness, TTL backstops missed events |
+| **Apache Tika** | Multi-format document parsing (ingestion) | One extraction library across PDF/Office/HTML/wikis instead of a bespoke parser per source format named in the FRs |
 
 ---
 
@@ -745,3 +801,6 @@ Kept for the author's own defense during Q&A; drop from the slide deck.
 10. **Chunk-metadata storage total corrected** to use the enriched 3,064 B row (v1 stated the enrichment, then totaled with the pre-enrichment size).
 11. **"Cumulative storage" relabeled** as point-in-time footprint (messages are a rolling window); retention policy stated (per-tenant, default 90-day purge).
 12. **Added:** API design (§7), deletion/offboarding path (§8), failure-mode table (§13), cost model (§14), observability + per-tenant rate limiting + isolation canary (§15), scale-floor qualification (§4).
+13. **Added: LLM build-vs-buy analysis (§14)** — API vs self-hosted vs hybrid, costed at realistic throughput and pricing, with a phased recommendation (API at launch, hybrid past the ~3M-DAU crossover) and the SPOF benefit of dual backends.
+14. **Fixed: "load recent turns" QPS basis (§4, §6, §12).** This read fires before the cache check on every query, not only on cache misses — it was sized against the post-cache rate (12,145 / 25,184) in three places. Corrected to the full query-submission rate (17,350 / 35,977): Conversation Service moves from 30 to 32 instances; Cassandra's read-per-node figures move from ~540 to ~667–675 reads/s/node. The storage-bound conclusion is unaffected — both figures are trivial for Cassandra — but the numbers themselves needed to match the sequence diagram they were derived from.
+15. **Added: Apache Tika** as the explicit document-parsing library (§5 storage engine split, §8 Flow 1, §10, §11, §16) — the "parse" half of Ingestion's "parse + chunk" step was previously unnamed.
